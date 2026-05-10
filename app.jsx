@@ -149,6 +149,38 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
     };
   };
 
+  const formatAvailableAliases = () => {
+    const keys = Object.keys(env || {}).filter((key) => !["isMobile", "isDisabled"].includes(key));
+    return keys.length > 0 ? keys.join("、") : "未检测到引用字段别名";
+  };
+
+  const getJsonSyntaxDetail = (err, jsonText) => {
+    const message = err && err.message ? err.message : "未知 JSON 语法错误";
+    const lineColumnMatch = message.match(/line\s+(\d+)\s+column\s+(\d+)/i);
+    if (lineColumnMatch) {
+      return `JSON 语法错误：第 ${lineColumnMatch[1]} 行第 ${lineColumnMatch[2]} 列附近，${message}`;
+    }
+
+    const positionMatch = message.match(/position\s+(\d+)/i);
+    if (!positionMatch) {
+      return `JSON 语法错误：${message}`;
+    }
+
+    const position = Number(positionMatch[1]);
+    if (!Number.isFinite(position) || position < 0) {
+      return `JSON 语法错误：${message}`;
+    }
+
+    const before = jsonText.slice(0, position);
+    const lines = before.split(/\r\n|\r|\n/);
+    const line = lines.length;
+    const column = lines[lines.length - 1].length + 1;
+    const start = Math.max(0, position - 40);
+    const end = Math.min(jsonText.length, position + 40);
+    const snippet = jsonText.slice(start, end).replace(/\s+/g, " ");
+    return `JSON 语法错误：第 ${line} 行第 ${column} 列附近，${message}。附近片段：${snippet}`;
+  };
+
   const isAnswered = (qt, ua) => {
     if (ua === undefined || ua === null || ua === "") return false;
     if (qt === "multi") return Array.isArray(ua) && ua.length > 0;
@@ -285,15 +317,44 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
   let questionList = [];
   let parseError = "";
   let invalidQuestions = [];
+  let parseDetails = [];
   try {
     if (!questionField) {
+      parseDetails = [
+        "未找到试题引用字段：请在字段设置中添加引用字段，并把别名设置为 questionTxt 或 exam。",
+        `当前检测到的 env 别名：${formatAvailableAliases()}。`,
+      ];
       throw new Error("未找到试题引用字段，请确认已添加引用字段，且别名为 questionTxt 或 exam");
     }
     if (questionField.value === undefined || questionField.value === null || String(questionField.value).trim() === "") {
+      parseDetails = [
+        "已找到试题引用字段，但字段值为空。",
+        "请确认 questionTxt/exam 引用字段中已经写入题库 JSON 数组。",
+      ];
       throw new Error("试题字段值为空");
     }
-    const jsonText = extractJsonArrayText(questionField.value);
-    const parsedQuestions = JSON.parse(jsonText);
+    let jsonText = "";
+    try {
+      jsonText = extractJsonArrayText(questionField.value);
+    } catch (err) {
+      parseDetails = [
+        err && err.message ? err.message : "无法从字段值中截取题目 JSON 数组。",
+        "请确认题库内容中存在完整的 JSON 数组，数组必须从 [ 开始并以匹配的 ] 结束。",
+      ];
+      throw err;
+    }
+
+    let parsedQuestions = null;
+    try {
+      parsedQuestions = JSON.parse(jsonText);
+    } catch (err) {
+      parseDetails = [
+        getJsonSyntaxDetail(err, jsonText),
+        "常见原因：缺少逗号、使用中文引号、字符串没有双引号、末尾多余逗号、括号没有闭合。",
+      ];
+      throw new Error("题目 JSON 语法错误");
+    }
+
     const rawQuestionList = Array.isArray(parsedQuestions) ? parsedQuestions : [parsedQuestions];
     const normalizedQuestions = rawQuestionList.map(normalizeQuestion);
     invalidQuestions = normalizedQuestions
@@ -303,6 +364,9 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
       .filter((item) => item.ok)
       .map((item) => item.value);
     if (questionList.length === 0) {
+      parseDetails = invalidQuestions.length > 0
+        ? invalidQuestions
+        : ["题目数组为空：JSON 数组中没有任何题目对象。"];
       throw new Error(
         invalidQuestions.length > 0
           ? `没有可渲染的有效试题：${invalidQuestions.join("；")}`
@@ -311,6 +375,7 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
     }
   } catch (err) {
     parseError = err && err.message ? err.message : "未知错误";
+    if (parseDetails.length === 0) parseDetails = [parseError];
   }
 
   const total = questionList.length;
@@ -523,13 +588,28 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
 
   if (parseError) {
     return (
-      <div className="text-red-500 p-3 border border-red-200 rounded">
-        <div className="font-medium">试题解析失败：{parseError}</div>
-        <div className="text-sm mt-1">
-          请检查：<br />
-          1. 是否已添加试题引用字段，别名是否为「questionTxt」或「exam」<br />
-          2. 题目须为 JSON 数组；字段前可加试卷名称等文字，数组须从「[」开始<br />
-          3. 单选/多选题必须提供 options 数组，判断题必须提供 answer
+      <div className="space-y-3 rounded-lg border border-red-200 bg-red-50 p-4 text-red-800">
+        <div>
+          <div className="font-semibold">试题解析失败</div>
+          <div className="mt-1 text-sm">{parseError}</div>
+        </div>
+        {parseDetails.length > 0 ? (
+          <div className="rounded border border-red-100 bg-white/80 p-3 text-sm text-red-900">
+            <div className="font-medium">失败原因</div>
+            <ul className="mt-2 list-disc space-y-1 pl-5">
+              {parseDetails.map((detail, index) => (
+                <li key={index}>{detail}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        <div className="text-sm text-red-700">
+          <div className="font-medium">修改建议</div>
+          <ul className="mt-1 list-disc space-y-1 pl-5">
+            <li>确认已添加试题引用字段，别名为 questionTxt 或 exam。</li>
+            <li>题目须为 JSON 数组；字段前可加试卷名称等文字，数组须从 [ 开始。</li>
+            <li>单选/多选题必须提供 options 数组；每题都必须提供 type、question 和 answer。</li>
+          </ul>
         </div>
       </div>
     );
