@@ -93,26 +93,51 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
   };
 
   const normalizeQuestion = (item, index) => {
+    const ni = index + 1;
     if (!item || typeof item !== "object" || Array.isArray(item)) {
-      return { ok: false, message: `第 ${index + 1} 题不是有效对象` };
+      return {
+        ok: false,
+        message: `第 ${ni} 题不是有效对象`,
+        hint: "每一题必须是形如 {\"type\":\"单选\", ...} 的单个对象，不能是数值、字符串或嵌套数组；若为数组请改为多个并列的题目对象。",
+      };
     }
 
     const rawType = item.type || item.questionType;
     const qt = parseQuestionType(rawType);
     if (!qt) {
-      return { ok: false, message: `第 ${index + 1} 题题型无效：${rawType || "未提供"}` };
+      const got = rawType === undefined || rawType === null || rawType === "" ? "未填写" : JSON.stringify(rawType);
+      return {
+        ok: false,
+        message: `第 ${ni} 题题型无效：${got}`,
+        hint: "请将 type（或 questionType）设为以下之一：单选、单选题、多选、多选题、判断、判断题（须与上述字样完全一致，区分大小写以外的标点）。",
+      };
     }
     const question = pickFirstText([item.question, item.title, item.stem]);
     if (!question) {
-      return { ok: false, message: `第 ${index + 1} 题缺少题干` };
+      return {
+        ok: false,
+        message: `第 ${ni} 题缺少题干`,
+        hint: "请至少填写 question、title、stem 三者之一作为题干文字。",
+      };
     }
 
     const answer = normalizeAnswer(item.answer, qt);
     if (qt === "multi" && answer.length === 0) {
-      return { ok: false, message: `第 ${index + 1} 题缺少正确答案` };
+      return {
+        ok: false,
+        message: `第 ${ni} 题缺少正确答案（多选）`,
+        hint: "多选题的 answer 应为非空数组，例如 [\"A\",\"B\"]；选项字母需与 options 中前缀一致。",
+      };
     }
     if (qt !== "multi" && !answer) {
-      return { ok: false, message: `第 ${index + 1} 题缺少正确答案` };
+      return {
+        ok: false,
+        message: `第 ${ni} 题缺少正确答案`,
+        hint:
+          qt === "judge"
+            ? "判断题请将 answer 设为 \"对\" 或 \"错\"（也可放在单元素数组中）。"
+            : "单选题请将 answer 设为选项键（如 \"A\"）或整段选项文案；可为字符串或单元素数组 [\"A\"]。",
+      };
     }
 
     if (qt === "judge") {
@@ -129,12 +154,20 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
 
     const rawOptions = item.options || item.choices || item.items;
     if (!Array.isArray(rawOptions)) {
-      return { ok: false, message: `第 ${index + 1} 题选项不是数组` };
+      return {
+        ok: false,
+        message: `第 ${ni} 题选项不是数组`,
+        hint: "单选/多选题必须提供 options（或 choices、items）字段，且为数组，例如 [\"A. xxx\",\"B. xxx\"]。",
+      };
     }
 
     const options = rawOptions.map(normalizeOption).filter(Boolean);
     if (options.length === 0) {
-      return { ok: false, message: `第 ${index + 1} 题缺少有效选项` };
+      return {
+        ok: false,
+        message: `第 ${ni} 题没有有效选项`,
+        hint: "请确保每个选项为非空字符串（或含 text/label 的对象）；去掉全是空白的项。",
+      };
     }
 
     return {
@@ -275,14 +308,29 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
     };
   };
 
+  /**
+   * 从字段原文中截取最外层 JSON 数组；优先从 "[{" 起算，减少说明文字里抢先出现 "[" 的误判。
+   * @returns {{ text: string, warnings: string[] }}
+   */
   const extractJsonArrayText = (raw) => {
+    const warnings = [];
     const s = String(raw || "")
       .trim()
       .replace(/^\uFEFF/, "");
-    const start = s.indexOf("[");
-    if (start === -1) {
-      throw new Error("未找到题目数据：字段中需包含以 [ 开头的 JSON 题目数组（前可有标题等文字）");
+    const preferred = s.search(/\[\s*\{/);
+    const firstBracket = s.indexOf("[");
+    let start;
+    if (preferred >= 0) {
+      start = preferred;
+    } else if (firstBracket >= 0) {
+      start = firstBracket;
+      warnings.push(
+        "未在内容中找到标准起始片段 [{ ，已使用第一个 [ 作为题库数组起点。若仍然解析失败，请把题库 JSON 挪到字段最前面，或删除说明文字中多余的 [  ] 符号。"
+      );
+    } else {
+      throw new Error("未找到字符 [：题库须为 JSON 数组。标准写法以 [{ 开头（表示题目对象列表），前面尽量不要夹杂单独的 [ 符号。");
     }
+
     let depth = 0;
     let inString = false;
     let escaped = false;
@@ -304,10 +352,29 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
       if (c === "[") depth++;
       else if (c === "]") {
         depth--;
-        if (depth === 0) return s.slice(start, i + 1);
+        if (depth === 0) return { text: s.slice(start, i + 1), warnings };
       }
     }
-    throw new Error("题目 JSON 数组未正确结束（括号 [ ] 不匹配）");
+    const tail = s.slice(Math.max(start, s.length - 120));
+    throw new Error(
+      `题目 JSON 数组未正确结束：扫描到字段末尾时括号仍不配平（可能少了 ]，或字符串里双引号未转义导致解析错位）。末尾附近：${tail.replace(/\s+/g, " ")}`
+    );
+  };
+
+  const makeFieldSnippet = (val, maxLen = 560) => {
+    const raw = val === undefined || val === null ? "" : String(val);
+    if (!raw) return "";
+    if (raw.length <= maxLen) return raw;
+    return `${raw.slice(0, maxLen)}\n…（已截断，全文共 ${raw.length} 个字符）`;
+  };
+
+  const PHASE_LABEL = {
+    ref: "引用字段",
+    empty: "题库为空",
+    extract: "内容截取",
+    json: "JSON 语法",
+    validate: "题目校验",
+    empty_list: "空题目列表",
   };
 
   const questionField =
@@ -316,30 +383,42 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
 
   let questionList = [];
   let parseError = "";
-  let invalidQuestions = [];
+  let invalidQuestionReports = [];
   let parseDetails = [];
+  let parseFailurePhase = "";
+  let questionFieldSnippet = "";
+
   try {
     if (!questionField) {
+      parseFailurePhase = "ref";
       parseDetails = [
-        "未找到试题引用字段：请在字段设置中添加引用字段，并把别名设置为 questionTxt 或 exam。",
-        `当前检测到的 env 别名：${formatAvailableAliases()}。`,
+        "当前表单里没有通过别名 questionTxt 或 exam 绑定到「题库」引用字段。",
+        `请在本字段设置中新增引用，并把别名设为 questionTxt 或 exam；当前 env 中可用的自定义别名：${formatAvailableAliases()}。`,
       ];
-      throw new Error("未找到试题引用字段，请确认已添加引用字段，且别名为 questionTxt 或 exam");
+      throw new Error("未找到试题引用字段（questionTxt / exam）");
     }
+
     if (questionField.value === undefined || questionField.value === null || String(questionField.value).trim() === "") {
+      parseFailurePhase = "empty";
       parseDetails = [
-        "已找到试题引用字段，但字段值为空。",
-        "请确认 questionTxt/exam 引用字段中已经写入题库 JSON 数组。",
+        "引用字段已绑定，但控件值为空（未粘贴题库或未保存表单）。",
+        "请在题库字段中粘贴以 [{ 开头的 JSON 数组并保存记录后再试。",
       ];
-      throw new Error("试题字段值为空");
+      throw new Error("试题引用字段内容为空");
     }
+
+    questionFieldSnippet = makeFieldSnippet(questionField.value);
+
     let jsonText = "";
     try {
-      jsonText = extractJsonArrayText(questionField.value);
+      const extracted = extractJsonArrayText(questionField.value);
+      jsonText = extracted.text;
     } catch (err) {
+      parseFailurePhase = "extract";
+      const base = err && err.message ? err.message : "无法从字段值中截取题目 JSON 数组。";
       parseDetails = [
-        err && err.message ? err.message : "无法从字段值中截取题目 JSON 数组。",
-        "请确认题库内容中存在完整的 JSON 数组，数组必须从 [ 开始并以匹配的 ] 结束。",
+        base,
+        "请确认：① 题库是一段完整的 JSON 数组；② 优先使用 [{ 作为起始；③ 说明文字里不要在题库数组之前单独出现 [ ，以免截取错位。",
       ];
       throw err;
     }
@@ -348,34 +427,47 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
     try {
       parsedQuestions = JSON.parse(jsonText);
     } catch (err) {
+      parseFailurePhase = "json";
       parseDetails = [
         getJsonSyntaxDetail(err, jsonText),
-        "常见原因：缺少逗号、使用中文引号、字符串没有双引号、末尾多余逗号、括号没有闭合。",
+        `已成功截取题库片段，长度约 ${jsonText.length} 字符；错误位置信息针对该片段。`,
+        "常见原因：缺少逗号、使用了中文引号「」、字符串未用英文双引号包裹、最后一个元素后多写了逗号、对象或数组未闭合。",
       ];
-      throw new Error("题目 JSON 语法错误");
+      throw new Error("题目 JSON 语法错误（JSON.parse 失败）");
     }
 
     const rawQuestionList = Array.isArray(parsedQuestions) ? parsedQuestions : [parsedQuestions];
     const normalizedQuestions = rawQuestionList.map(normalizeQuestion);
-    invalidQuestions = normalizedQuestions
+    invalidQuestionReports = normalizedQuestions
       .filter((item) => !item.ok)
-      .map((item) => item.message);
+      .map((item) => ({
+        message: item.message,
+        hint: item.hint || "请对照字段说明检查该题的 type、question、answer、options。",
+      }));
     questionList = normalizedQuestions
       .filter((item) => item.ok)
       .map((item) => item.value);
+
     if (questionList.length === 0) {
-      parseDetails = invalidQuestions.length > 0
-        ? invalidQuestions
-        : ["题目数组为空：JSON 数组中没有任何题目对象。"];
-      throw new Error(
-        invalidQuestions.length > 0
-          ? `没有可渲染的有效试题：${invalidQuestions.join("；")}`
-          : "题目数组为空"
-      );
+      if (invalidQuestionReports.length > 0) {
+        parseFailurePhase = "validate";
+        parseDetails = [
+          `题库 JSON 中共 ${rawQuestionList.length} 条记录，但没有任何一题通过校验，无法进入答题页。`,
+          "下方列出每一题的具体错误与修改建议；修复后需保存题库字段再刷新。",
+        ];
+        throw new Error(`全部题目校验失败（${invalidQuestionReports.length} 条均无效）`);
+      }
+      parseFailurePhase = "empty_list";
+      parseDetails = [
+        "JSON 解析成功，但题目数组为空（例如 []），或唯一元素不是题目对象。",
+        "请至少放入一道包含 type、question、answer 的题目对象。",
+      ];
+      throw new Error("题目数组为空或无可解析的题目对象");
     }
   } catch (err) {
     parseError = err && err.message ? err.message : "未知错误";
     if (parseDetails.length === 0) parseDetails = [parseError];
+    if (!parseFailurePhase) parseFailurePhase = "extract";
   }
 
   const total = questionList.length;
@@ -587,29 +679,108 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
   };
 
   if (parseError) {
+    const phaseTitle = PHASE_LABEL[parseFailurePhase] || "试题解析";
+    const phaseHints =
+      parseFailurePhase === "ref"
+        ? [
+            "在本自定义字段的配置里添加「引用类型」字段，绑定存放题库的控件，并把别名写成 questionTxt 或 exam（与代码中的 env 一致）。",
+            "保存表单设计后，确保该引用字段在表单上可见且已写入题库内容。",
+          ]
+        : parseFailurePhase === "empty"
+          ? ["打开绑定好的题库字段，将完整的 JSON 题库粘贴进去并保存当前记录。"]
+          : parseFailurePhase === "extract"
+            ? [
+                "把题库 JSON 尽量放在字段最开头，或保证最先出现的 [ 与紧随其后的 { 组成 [{ ，表示题目数组。",
+                "若标题里必须提到方括号，请避免在题库数组之前出现单独的 [ 字符。",
+              ]
+            : parseFailurePhase === "json"
+              ? [
+                  "用 VS Code 等编辑器打开 JSON，查看报错行列；把中文引号改为英文双引号，检查逗号与括号配对。",
+                  "可把下方「题库原文」复制到 jsonlint.com 等工具里格式化验证。",
+                ]
+              : parseFailurePhase === "validate"
+                ? [
+                    "按下方「逐题诊断」逐项修改题库；改一项保存一次便于定位。",
+                    "题型字段必须与示例完全一致（如「单选」而非「单项选择」）。",
+                  ]
+                : parseFailurePhase === "empty_list"
+                  ? ["确认数组内至少有一个 {...} 题目对象，而不是只有空白或注释。"]
+                  : [
+                      "确认已添加试题引用字段 questionTxt 或 exam，题库为 [{ 开头的 JSON 数组。",
+                      "每道题需包含 type、question、answer；单选/多选还需 options 数组。",
+                    ];
+
     return (
-      <div className="space-y-3 rounded-lg border border-red-200 bg-red-50 p-4 text-red-800">
-        <div>
-          <div className="font-semibold">试题解析失败</div>
-          <div className="mt-1 text-sm">{parseError}</div>
+      <div className="space-y-4 rounded-xl border border-red-200 bg-red-50/90 p-4 text-red-900 shadow-sm max-w-2xl mx-auto">
+        <div className="flex flex-wrap items-center gap-2 border-b border-red-100 pb-3">
+          <span className="rounded-full bg-red-200 px-2.5 py-0.5 text-xs font-semibold text-red-950">{phaseTitle}</span>
+          <span className="text-lg font-semibold text-red-950">试题解析失败</span>
         </div>
+
+        <div className="rounded-lg bg-white/90 p-3 shadow-sm ring-1 ring-red-100">
+          <div className="text-xs font-medium uppercase tracking-wide text-red-600/90">摘要</div>
+          <p className="mt-1 text-sm leading-relaxed text-red-950">{parseError}</p>
+        </div>
+
         {parseDetails.length > 0 ? (
-          <div className="rounded border border-red-100 bg-white/80 p-3 text-sm text-red-900">
-            <div className="font-medium">失败原因</div>
-            <ul className="mt-2 list-disc space-y-1 pl-5">
+          <div className="rounded-lg border border-red-100 bg-white p-3 text-sm shadow-sm">
+            <div className="font-semibold text-red-950">诊断说明</div>
+            <ul className="mt-2 list-disc space-y-2 pl-5 text-red-900 marker:text-red-400">
               {parseDetails.map((detail, index) => (
-                <li key={index}>{detail}</li>
+                <li key={index} className="leading-relaxed">
+                  {detail}
+                </li>
               ))}
             </ul>
           </div>
         ) : null}
-        <div className="text-sm text-red-700">
-          <div className="font-medium">修改建议</div>
-          <ul className="mt-1 list-disc space-y-1 pl-5">
-            <li>确认已添加试题引用字段，别名为 questionTxt 或 exam。</li>
-            <li>题目须为 JSON 数组；字段前可加试卷名称等文字，数组须从 [ 开始。</li>
-            <li>单选/多选题必须提供 options 数组；每题都必须提供 type、question 和 answer。</li>
+
+        {invalidQuestionReports.length > 0 ? (
+          <div className="rounded-lg border border-amber-200 bg-amber-50/80 p-3 text-sm shadow-sm">
+            <div className="font-semibold text-amber-950">逐题诊断（共 {invalidQuestionReports.length} 条）</div>
+            <ul className="mt-3 space-y-3">
+              {invalidQuestionReports.map((row, index) => (
+                <li
+                  key={index}
+                  className="rounded-md border border-amber-100 bg-white p-3 text-amber-950 shadow-sm"
+                >
+                  <div className="font-medium text-red-900">{row.message}</div>
+                  <div className="mt-2 border-l-2 border-amber-400 pl-3 text-sm leading-relaxed text-gray-800">
+                    <span className="font-medium text-gray-600">修改建议：</span>
+                    {row.hint}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        {questionFieldSnippet ? (
+          <details className="group rounded-lg border border-gray-200 bg-white p-3 text-sm shadow-sm open:ring-1 open:ring-gray-200">
+            <summary className="cursor-pointer select-none font-medium text-gray-800 hover:text-gray-950">
+              查看题库字段原文（便于对照行列号）
+              <span className="ml-2 text-xs font-normal text-gray-500">（用于排查 JSON 语法或截取范围）</span>
+            </summary>
+            <pre className="mt-3 max-h-52 overflow-auto whitespace-pre-wrap break-all rounded bg-gray-900/95 p-3 text-xs leading-relaxed text-green-100">
+              {questionFieldSnippet}
+            </pre>
+          </details>
+        ) : null}
+
+        <div className="rounded-lg border border-red-100 bg-white/70 p-3 text-sm text-red-950">
+          <div className="font-semibold">针对当前阶段的修改步骤</div>
+          <ul className="mt-2 list-decimal space-y-1.5 pl-5 marker:text-red-400">
+            {phaseHints.map((line, i) => (
+              <li key={i} className="leading-relaxed">
+                {line}
+              </li>
+            ))}
           </ul>
+        </div>
+
+        <div className="text-xs leading-relaxed text-red-800/80">
+          <span className="font-medium">通用格式：</span>
+          题库须为 JSON 数组；单选/多选题须有 options；每题须有 type、question、answer。判断题 answer 为「对」或「错」。
         </div>
       </div>
     );
@@ -640,15 +811,23 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
   const showResultPanel = submitted || env.isDisabled;
   const canRetry = submitted && !env.isDisabled && currentScoreRate !== 100;
   const pct = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
+  const showWrongBadge = submitted && !isCorrect(q, userAns);
 
   return (
     <div className="space-y-4 p-1 max-w-2xl mx-auto">
-      {invalidQuestions.length > 0 ? (
-        <div className="p-3 border border-yellow-200 rounded bg-yellow-50 text-yellow-800 text-sm space-y-1">
-          <div className="font-medium">以下题目已跳过：</div>
-          {invalidQuestions.map((message, index) => (
-            <div key={index}>{message}</div>
-          ))}
+      {invalidQuestionReports.length > 0 ? (
+        <div className="p-3 border border-yellow-200 rounded-lg bg-yellow-50 text-yellow-900 text-sm space-y-2 shadow-sm">
+          <div className="font-semibold">以下题目已跳过（不影响其余题目作答）</div>
+          <ul className="space-y-2">
+            {invalidQuestionReports.map((row, index) => (
+              <li key={index} className="rounded border border-yellow-100 bg-white/80 px-2 py-1.5">
+                <span className="font-medium text-yellow-950">{row.message}</span>
+                {row.hint ? (
+                  <div className="mt-1 text-xs leading-relaxed text-yellow-900/90">建议：{row.hint}</div>
+                ) : null}
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
 
@@ -701,6 +880,14 @@ function AnswerField({ value, formData = {}, onChange, env = {} } = {}) {
                 </>
               ) : null}
             </span>
+            {showWrongBadge ? (
+              <span
+                className="rounded-md border border-red-300 bg-red-50 px-2 py-0.5 text-xs font-semibold text-red-700 shadow-sm"
+                title="本题作答与标准答案不一致"
+              >
+                错题
+              </span>
+            ) : null}
           </span>
           <span>{q.question}</span>
         </div>
